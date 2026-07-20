@@ -2736,7 +2736,7 @@ def check_exhibition_requirements():
     """
     Strict Pre-Flight Check for Exhibition Mode.
     Ensures that the Main gallery has been run before, the database exists, 
-    and at least one public collection is configured.
+    and at least one public or user-shared collection is configured.
     Exits the application if requirements are not met to prevent ghost databases.
     """
     if not IS_EXHIBITION_MODE:
@@ -2771,19 +2771,23 @@ def check_exhibition_requirements():
                 print(f"   {Colors.YELLOW}python smartgallery.py{Colors.RESET}\n")
                 sys.exit(1)
 
-            # Check if there is at least one PUBLIC user album
-            public_colls = conn.execute("SELECT COUNT(*) FROM collections WHERE type='user_album' AND is_public=1").fetchone()[0]
-            
-            if public_colls == 0:
-                print(f"\n{Colors.RED}{Colors.BOLD}❌ CRITICAL ERROR: No Exhibition Ready Collections Found{Colors.RESET}")
-                print(f"{Colors.RED}Exhibition Mode is a showcase. It only displays collections marked as 'Exhibition Ready'.{Colors.RESET}")
-                print(f"{Colors.RED}Currently, your database has 0 Exhibition Ready collections, so the Exhibition would be completely empty.{Colors.RESET}")
+            # Check if at least one user album is public or shared with a user.
+            accessible_colls = conn.execute("""
+                SELECT COUNT(*)
+                FROM collections
+                WHERE type = 'user_album'
+                  AND (is_public = 1 OR TRIM(COALESCE(shared_users, '')) != '')
+            """).fetchone()[0]
+
+            if accessible_colls == 0:
+                print(f"\n{Colors.RED}{Colors.BOLD}❌ CRITICAL ERROR: No Exhibition Collections Found{Colors.RESET}")
+                print(f"{Colors.RED}Exhibition Mode displays collections that are public or shared with at least one user.{Colors.RESET}")
+                print(f"{Colors.RED}Currently, your database has no accessible Exhibition collections, so the Exhibition would be completely empty.{Colors.RESET}")
                 print(f"\n{Colors.CYAN}{Colors.BOLD}💡 HOW TO FIX IT:{Colors.RESET}")
                 print(f"1. Start the standard gallery: {Colors.YELLOW}python smartgallery.py{Colors.RESET}")
                 print(f"2. Log in, select some files, and click the 📚️ Add/Remove from collection button.")
-                print(f"3. Create a new Collection and answer 'Yes' when asked if it should be set as Exhibition Ready.")
-                print(f"   (Or edit an existing one from the sidebar menu: ⋮ -> 👁️ Set as Exhibition Ready).")
-                print(f"4. Once you have at least one public collection, restart with --exhibition.\n")
+                print(f"3. Mark a collection as Exhibition Ready or share it with at least one user.")
+                print(f"4. Restart with --exhibition.\n")
                 sys.exit(1)
                 
     except sqlite3.DatabaseError as e:
@@ -6264,51 +6268,130 @@ def stream_video(file_id):
 
 # --- COLLECTIONS / CATEGORIES API ---
 
+def get_descendant_file_counts(conn, countable_collection_ids):
+    """Count unique files in descendant collections, excluding direct membership."""
+    if not countable_collection_ids:
+        return {}
+
+    placeholders = ','.join('?' for _ in countable_collection_ids)
+    rows = conn.execute(f"""
+        WITH RECURSIVE counted_descendants(id) AS (
+            SELECT DISTINCT collection_id
+            FROM collection_files
+            WHERE collection_id IN ({placeholders})
+        ), ancestry(ancestor_id, descendant_id) AS (
+            SELECT c.parent_id, c.id
+            FROM collections c
+            JOIN counted_descendants d ON d.id = c.id
+            WHERE c.parent_id IS NOT NULL
+            UNION
+            SELECT c.parent_id, a.descendant_id
+            FROM ancestry a
+            JOIN collections c ON c.id = a.ancestor_id
+            WHERE c.parent_id IS NOT NULL
+        )
+        SELECT a.ancestor_id, COUNT(DISTINCT cf.file_id) AS descendant_file_count
+        FROM ancestry a
+        JOIN collection_files cf ON cf.collection_id = a.descendant_id
+        WHERE a.ancestor_id != a.descendant_id
+        GROUP BY a.ancestor_id
+    """, countable_collection_ids).fetchall()
+    return {row['ancestor_id']: row['descendant_file_count'] for row in rows}
+
 
 @app.route('/galleryout/api/collections', methods=['GET'])
 def get_collections():
     user_id = str(session.get('user_id', '')).strip()
     user_role = session.get('role', 'GUEST')
     with get_db_connection() as conn:
-        # Fetch collections and force field types
-        rows = conn.execute("SELECT * FROM collections ORDER BY name").fetchall()
-        
-        filtered = []
-        for r in rows:
-            c = dict(r)
-            
-            # Logic for Exhibition Mode
-            if IS_EXHIBITION_MODE and user_role not in ['ADMIN', 'MANAGER', 'STAFF']:
-                if c['type'] == 'system_flag': continue
-                
-                # Check Public flag
+        rows = conn.execute("""
+            SELECT c.*,
+                   (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count
+            FROM collections c
+            ORDER BY c.name
+        """).fetchall()
+
+        all_cols = [dict(r) for r in rows]
+        flags = [c for c in all_cols if c['type'] == 'system_flag']
+        albums = [c for c in all_cols if c['type'] == 'user_album']
+        for flag in flags:
+            flag.pop('file_count', None)
+
+        filtered_albums = []
+
+        if IS_EXHIBITION_MODE and user_role not in ['ADMIN', 'MANAGER', 'STAFF']:
+            explicit_access_ids = set()
+            album_dict = {c['id']: c for c in albums}
+
+            # Step 1: Identify explicitly accessible collections
+            for c in albums:
                 is_public = int(c.get('is_public', 0)) == 1
-                
-                # Robust Shared Users extraction
                 shared_raw = str(c.get('shared_users', '')).split(',')
-                # Remove spaces, ensure they are strings
                 shared_list = [str(uid).strip() for uid in shared_raw if uid.strip()]
-                
-                #DEBUG: Log what we are comparing
-                #print(f"DEBUG: Comparing UserID '{user_id}' against shared_list {shared_list}", c['name'])
-                
-                if not is_public and str(user_id) not in shared_list:
-                    continue
-                if not is_public and str(user_id) in shared_list:
-                    c['is_shared_access'] = True
-            
-            if IS_EXHIBITION_MODE and user_role in ['ADMIN', 'MANAGER', 'STAFF']:
-                # Robust Shared Users extraction
+
+                if is_public or str(user_id) in shared_list:
+                    explicit_access_ids.add(c['id'])
+                    if str(user_id) in shared_list:
+                        c['is_shared_access'] = True
+
+            # Step 2: Traverse upwards to unlock ancestor paths for the tree
+            required_ancestors = set()
+            for cid in explicit_access_ids:
+                curr = album_dict.get(cid)
+                while curr and curr.get('parent_id'):
+                    pid = curr['parent_id']
+                    required_ancestors.add(pid)
+                    curr = album_dict.get(pid)
+
+            # Step 3: Build final list with locked/unlocked flags
+            for c in albums:
+                if c['id'] in explicit_access_ids:
+                    c['restricted_access'] = False
+                    filtered_albums.append(c)
+                elif c['id'] in required_ancestors:
+                    c['restricted_access'] = True
+                    filtered_albums.append(c)
+
+        elif IS_EXHIBITION_MODE and user_role in ['ADMIN', 'MANAGER', 'STAFF']:
+            for c in albums:
                 shared_raw = str(c.get('shared_users', '')).split(',')
-                # Remove spaces, ensure they are strings
-                shared_list =[str(uid).strip() for uid in shared_raw if uid.strip()]
+                shared_list = [str(uid).strip() for uid in shared_raw if uid.strip()]
                 if shared_list:
                     c['is_shared_access'] = True
-                
-            filtered.append(c)
+                c['restricted_access'] = False
+            filtered_albums = albums
+
+        else:
+            for c in albums:
+                c['restricted_access'] = False
+            filtered_albums = albums
+
+        if IS_EXHIBITION_MODE:
+            count_album_ids = [
+                c['id'] for c in filtered_albums
+                if not c.get('restricted_access') and (c.get('is_public') or c.get('is_shared_access'))
+            ]
+        else:
+            count_album_ids = [c['id'] for c in filtered_albums]
+
+        all_count = 0
+        if count_album_ids:
+            placeholders = ','.join('?' for _ in count_album_ids)
+            all_count = conn.execute(
+                f"SELECT COUNT(DISTINCT file_id) FROM collection_files WHERE collection_id IN ({placeholders})",
+                count_album_ids
+            ).fetchone()[0]
+
+        descendant_counts = get_descendant_file_counts(conn, count_album_ids)
+        for c in filtered_albums:
+            c['descendant_file_count'] = descendant_counts.get(c['id'], 0)
+            if c.get('restricted_access'):
+                c['file_count'] = None
+
         return jsonify({
-            'flags': [c for c in filtered if c['type'] == 'system_flag'],
-            'albums': [c for c in filtered if c['type'] == 'user_album']
+            'flags': flags,
+            'albums': filtered_albums,
+            'all_count': all_count
         })
 
 @app.route('/galleryout/api/sidebar_state')
@@ -6317,14 +6400,39 @@ def get_sidebar_state():
     folders = get_dynamic_folder_config(force_refresh=True)
     with get_db_connection() as conn:
         flags = conn.execute("SELECT * FROM collections WHERE type='system_flag' ORDER BY id").fetchall()
-        albums = conn.execute("SELECT * FROM collections WHERE type='user_album' ORDER BY name").fetchall()
+        if IS_EXHIBITION_MODE:
+            albums = conn.execute("SELECT * FROM collections WHERE type='user_album' ORDER BY name").fetchall()
+            all_count = None
+        else:
+            albums = conn.execute("""
+                SELECT c.*,
+                       (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count
+                FROM collections c
+                WHERE c.type='user_album'
+                ORDER BY c.name
+            """).fetchall()
+            all_count = conn.execute("""
+                SELECT COUNT(DISTINCT cf.file_id)
+                FROM collection_files cf
+                JOIN collections c ON c.id = cf.collection_id
+                WHERE c.type='user_album'
+            """).fetchone()[0]
+        album_dicts = [dict(r) for r in albums]
+        if not IS_EXHIBITION_MODE:
+            descendant_counts = get_descendant_file_counts(conn, [album['id'] for album in album_dicts])
+            for album in album_dicts:
+                album['descendant_file_count'] = descendant_counts.get(album['id'], 0)
+
+    collections = {
+        'flags': [dict(r) for r in flags],
+        'albums': album_dicts
+    }
+    if all_count is not None:
+        collections['all_count'] = all_count
     
     return jsonify({
         'folders': folders,
-        'collections': {
-            'flags': [dict(r) for r in flags],
-            'albums': [dict(r) for r in albums]
-        }
+        'collections': collections
     })
 
 @app.route('/galleryout/api/collections/rename', methods=['POST'])
