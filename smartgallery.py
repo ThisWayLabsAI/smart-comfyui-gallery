@@ -1,7 +1,7 @@
 # SmartGallery DAM for ComfyUI
 # Author: Biagio Maffettone © 2025-2026 — Free to use/modify with credit. Provided "as is". See license on GitHub.
 #
-# Version: 2.16 - July 24, 2026
+# Version: 2.20 - August 01, 2026
 # Check the GitHub repository for updates, bug fixes, and contributions.
 #
 # Contact: biagiomaf@gmail.com
@@ -339,8 +339,8 @@ AI_MODELS_FOLDER_NAME = '.AImodels'
 ENABLE_DAM_MODE = True
 
 # --- APP INFO ---
-APP_VERSION = "2.16"
-APP_VERSION_DATE = "July 24, 2026"
+APP_VERSION = "2.20"
+APP_VERSION_DATE = "August 01, 2026"
 GITHUB_REPO_URL = "https://github.com/biagiomaf/smart-comfyui-gallery"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/biagiomaf/smart-comfyui-gallery/main/smartgallery.py"
 
@@ -1391,7 +1391,9 @@ def analyze_file_metadata(filepath):
         '.mkv': 'video', '.avi': 'video', '.m4v': 'video', 
         '.wmv': 'video', '.flv': 'video', '.mts': 'video', '.ts': 'video',
         # Audio
-        '.mp3': 'audio', '.wav': 'audio', '.ogg': 'audio', '.flac': 'audio', '.m4a': 'audio'
+        '.mp3': 'audio', '.wav': 'audio', '.ogg': 'audio', '.flac': 'audio', '.m4a': 'audio',
+        # Documents / Notes
+        '.txt': 'document', '.md': 'document'
     }
     details['type'] = type_map.get(ext_lower, 'unknown')
     if details['type'] == 'unknown' and ext_lower == '.webp': details['type'] = 'animated_image' if is_webp_animated(filepath) else 'image'
@@ -2059,6 +2061,8 @@ def init_db(conn=None):
         try:
             cursor_col = conn.execute("PRAGMA table_info(collections)")
             col_columns = {row['name'] for row in cursor_col.fetchall()}
+            # Auto-fix existing txt/md files in database from unknown to document
+            conn.execute("UPDATE files SET type = 'document' WHERE (type = 'unknown' OR type IS NULL OR type = '') AND (LOWER(name) LIKE '%.txt' OR LOWER(name) LIKE '%.md')")
             if 'is_public' not in col_columns:
                 print("INFO: Updating Database Schema... Adding 'is_public' to collections")
                 conn.execute("ALTER TABLE collections ADD COLUMN is_public INTEGER DEFAULT 0")
@@ -2153,8 +2157,8 @@ def get_dynamic_folder_config(force_refresh=False):
         except: pass
 
         all_folders = {}
-        for dirpath, dirnames, _ in os.walk(BASE_OUTPUT_PATH):
-            dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
+        for dirpath, dirnames, _ in os.walk(BASE_OUTPUT_PATH, followlinks=True):
+            dirnames[:] = [d for d in dirnames if (not d.startswith('.') or d == '.collection_notes') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
             for dirname in dirnames:
                 full_path = os.path.normpath(os.path.join(dirpath, dirname)).replace('\\', '/')
                 relative_path = os.path.relpath(full_path, BASE_OUTPUT_PATH).replace('\\', '/')
@@ -2210,7 +2214,8 @@ def get_dynamic_folder_config(force_refresh=False):
                 'mtime': folder_data['mtime'],
                 'is_watched': is_watched_folder,
                 'is_explicitly_watched': is_explicitly_watched,
-                'is_mount': is_mount
+                'is_mount': is_mount,
+                'is_hidden': folder_data['display_name'] == '.collection_notes'
             }
     except FileNotFoundError:
         print(f"WARNING: The base directory '{BASE_OUTPUT_PATH}' was not found.")
@@ -2241,15 +2246,15 @@ def background_watcher_task():
                         folder_path = row['path'] 
                         is_recursive = row['recursive']
                         
-                        valid_exts = {'.png','.jpg','.jpeg','.webp','.gif','.mp4','.mov','.avi','.webm'}
+                        valid_exts = {'.png','.jpg','.jpeg','.webp','.gif','.mp4','.mov','.avi','.webm','.txt','.md'}
                         EXCLUDED = {'.thumbnails_cache', '.sqlite_cache', '.zip_downloads', '.AImodels', 'venv', 'venv-ai', '.git'}
                         
                         files_to_check = []
 
                         if os.path.isdir(folder_path):
                             if is_recursive:
-                                for root, dirs, files in os.walk(folder_path, topdown=True):
-                                    dirs[:] = [d for d in dirs if not d.startswith('.') and d not in EXCLUDED]
+                                for root, dirs, files in os.walk(folder_path, topdown=True, followlinks=True):
+                                    dirs[:] = [d for d in dirs if (not d.startswith('.') or d == '.collection_notes') and d not in EXCLUDED]
                                     for f in files:
                                         if os.path.splitext(f)[1].lower() in valid_exts:
                                             files_to_check.append(os.path.join(root, f))
@@ -2341,7 +2346,7 @@ def full_sync_database(conn):
     valid_extensions = {
         '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif',  # Images
         '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.wmv', '.flv', '.mts', '.ts', # Videos
-        '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac' # Audio
+        '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.txt', '.md' # Audio & Docs
     }
 
     for folder_data in all_folders.values():
@@ -2501,7 +2506,7 @@ def sync_folder_on_demand(folder_path):
     
     try:
         with get_db_connection() as conn:
-            disk_files, valid_extensions = {}, {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mkv', '.webm', '.mov', '.avi', '.mp3', '.wav', '.ogg', '.flac'}
+            disk_files, valid_extensions = {}, {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.mkv', '.webm', '.mov', '.avi', '.mp3', '.wav', '.ogg', '.flac', '.txt', '.md'}
             if os.path.isdir(folder_path):
                 for name in os.listdir(folder_path):
                     filepath = os.path.join(folder_path, name)
@@ -2618,7 +2623,7 @@ def scan_folder_and_extract_options(folder_path, recursive=False):
         
         if recursive:
             # Recursive scan using os.walk
-            for root, dirs, files in os.walk(folder_path):
+            for root, dirs, files in os.walk(folder_path, followlinks=True):
                 # Filter out hidden/protected folders in-place
                 dirs[:] = [d for d in dirs if not d.startswith('.') and d not in [THUMBNAIL_CACHE_FOLDER_NAME, SQLITE_CACHE_FOLDER_NAME, ZIP_CACHE_FOLDER_NAME, AI_MODELS_FOLDER_NAME]]
                 for filename in files:
@@ -2834,6 +2839,7 @@ def initialize_gallery():
     os.makedirs(THUMBNAIL_CACHE_DIR, exist_ok=True)
     os.makedirs(SQLITE_CACHE_DIR, exist_ok=True)
     os.makedirs(CLEAN_CACHE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(BASE_OUTPUT_PATH, '.collection_notes'), exist_ok=True)
     os.makedirs(IMPORTED_WORKFLOWS_DIR, exist_ok=True)
     
     with get_db_connection() as conn:
@@ -2898,7 +2904,9 @@ def get_filter_options_from_db(conn, scope, folder_path=None, recursive=False):
                 # 1. Extensions
                 _, ext = os.path.splitext(f_name)
                 if ext: 
-                    extensions.add(ext.lstrip('.').lower())
+                    ext_clean = ext.lstrip('.').lower()
+                    if ext_clean not in ['txt', 'md']:
+                        extensions.add(ext_clean)
                 
                 # 2. Prefixes
                 if not prefix_limit_reached and '_' in f_name:
@@ -2980,6 +2988,10 @@ def ensure_admin_user(conn):
 
 def is_file_accessible(file_id):
     """Checks if the current user has permission to access this specific file."""
+    must_auth = IS_EXHIBITION_MODE or FORCE_LOGIN
+    if must_auth and not session.get('user_id'):
+        return False
+
     if not IS_EXHIBITION_MODE and not FORCE_LOGIN:
         return True
         
@@ -3003,11 +3015,8 @@ def is_file_accessible(file_id):
             WHERE cf.file_id = ? 
             AND c.type = 'user_album'
         '''
-        if user_id:
-            safe_uid = user_id.replace("'", "''")
-            query += f" AND (c.is_public = 1 OR (',' || c.shared_users || ',') LIKE '%,{safe_uid},%')"
-        else:
-            query += " AND c.is_public = 1"
+        safe_uid = user_id.replace("'", "''")
+        query += f" AND (c.is_public = 1 OR (',' || c.shared_users || ',') LIKE '%,{safe_uid},%')"
             
         result = conn.execute(query, (file_id,)).fetchone()
         return bool(result)
@@ -3067,6 +3076,11 @@ def strip_media_metadata(input_path, output_path, file_type):
                 else:
                     # Static image: Save pixel data only, explicitly stripping EXIF/XMP
                     img.save(output_path, img.format, optimize=True, exif=b"", xmp=b"")
+            return True
+
+        # --- CASE C: DOCUMENTS (Bypass stripping, just copy safely) ---
+        elif file_type == 'document' or input_path.lower().endswith(('.txt', '.md')):
+            shutil.copy2(input_path, output_path)
             return True
 
         # --- CASE B: REAL VIDEOS & AUDIO (MP4, MOV, MKV, MP3, WAV...) ---
@@ -3572,8 +3586,8 @@ def ai_indexing_add_folder():
         files_found = []
         try:
             if recursive:
-                for r, d, f in os.walk(raw_path, topdown=True, followlinks=False):
-                    d[:] = [x for x in d if not x.startswith('.') and x not in exc]
+                for r, d, f in os.walk(raw_path, topdown=True, followlinks=True):
+                    d[:] = [x for x in d if (not x.startswith('.') or x == '.collection_notes') and x not in exc]
                     for x in f:
                         if os.path.splitext(x)[1].lower() in valid: files_found.append(os.path.join(r, x))
             else:
@@ -3959,7 +3973,7 @@ def gallery_view(folder_key):
     # --- PATH B: STANDARD VIEW / SEARCH ---
     if not is_ai_search and not is_omniquery:
         with get_db_connection() as conn:
-            conditions, params = [], []
+            conditions, params = ["f.type != 'document' AND LOWER(f.name) NOT LIKE '%.txt' AND LOWER(f.name) NOT LIKE '%.md'"], []
 
             if search_term:
                 conditions.append("name LIKE ?")
@@ -4087,10 +4101,18 @@ def gallery_view(folder_key):
                 conditions.append("(ai_caption IS NULL OR ai_caption = '')")
 
             if start_date:
-                try: conditions.append("mtime >= ?"); params.append(datetime.strptime(start_date, '%Y-%m-%d').timestamp())
+                try: 
+                    ts = datetime.strptime(start_date, '%Y-%m-%d').timestamp()
+                    conditions.append("mtime >= ?")
+                    params.append(ts)
+                    active_filters_count += 1
                 except: pass
             if end_date:
-                try: conditions.append("mtime <= ?"); params.append(datetime.strptime(end_date, '%Y-%m-%d').timestamp() + 86399)
+                try: 
+                    ts = datetime.strptime(end_date, '%Y-%m-%d').timestamp() + 86399
+                    conditions.append("mtime <= ?")
+                    params.append(ts)
+                    active_filters_count += 1
                 except: pass
 
             if selected_rating_ranges:
@@ -4264,8 +4286,8 @@ def gallery_view(folder_key):
     if wf_files: active_filters_count += 1
     if wf_prompt: active_filters_count += 1
     if request.args.get('comment_search', '').strip(): active_filters_count += 1
-    if start_date: active_filters_count += 1
-    if end_date: active_filters_count += 1
+    
+    
     if selected_exts: active_filters_count += 1
     if selected_prefixes: active_filters_count += 1
     if selected_raters: active_filters_count += 1
@@ -4350,7 +4372,7 @@ def gallery_view(folder_key):
                            session_username=session.get('username', 'Guest'), 
                            session_user_id=session.get('user_id'),
                            session_role=session.get('role'), 
-                           session_full_name=session.get('full_name'))
+                           session_full_name=session.get('full_name'), has_notes=False, note_files=[])
                            
 @app.route('/galleryout/upload', methods=['POST'])
 @management_api_only
@@ -4362,7 +4384,7 @@ def upload_files():
     destination_path = folders[folder_key]['path']
     if 'files' not in request.files: return jsonify({'status': 'error', 'message': 'No files were uploaded.'}), 400
     uploaded_files, errors, success_count = request.files.getlist('files'), {}, 0
-    ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif', '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.wmv', '.flv', '.mts', '.ts', '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.json', '.txt'}
+    ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif', '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.wmv', '.flv', '.mts', '.ts', '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.json', '.txt', '.md'}
     for file in uploaded_files:
         if file and file.filename:
             filename = secure_filename(file.filename)
@@ -5022,12 +5044,16 @@ def delete_folder(folder_key):
 @app.route('/galleryout/api/current_view_ids')
 def get_current_view_ids():
     """Returns all file IDs currently in the global search cache."""
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     global gallery_view_cache
     ids = [f['id'] for f in gallery_view_cache]
     return jsonify({'status': 'success', 'ids': ids})
 
 @app.route('/galleryout/load_more')
 def load_more():
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'files': []}), 401
     offset = request.args.get('offset', 0, type=int)
     if offset >= len(gallery_view_cache): return jsonify(files=[])
     return jsonify(files=gallery_view_cache[offset:offset + PAGE_SIZE])
@@ -5753,6 +5779,8 @@ def serve_thumbnail(file_id):
 # --- STORYBOARD (GRID SYSTEM) - FAST + SMART CORRUPTION DETECTION ---
 @app.route('/galleryout/storyboard/<string:file_id>')
 def get_storyboard(file_id):
+    if not is_file_accessible(file_id):
+        abort(403, description="Access Denied.")
     # 1. Validation
     has_ffmpeg = FFPROBE_EXECUTABLE_PATH is not None
     
@@ -6262,6 +6290,8 @@ def check_metadata(file_id):
     Lightweight endpoint to check real-time status of metadata.
     Now includes Real Path resolution for mounted folders.
     """
+    if not is_file_accessible(file_id):
+        return jsonify({'status': 'error', 'message': 'Access Denied'}), 403
     try:
         with get_db_connection() as conn:
             # Added 'path' to selection to resolve symlinks
@@ -6399,12 +6429,15 @@ def get_descendant_file_counts(conn, countable_collection_ids):
 
 @app.route('/galleryout/api/collections', methods=['GET'])
 def get_collections():
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     user_id = str(session.get('user_id', '')).strip()
     user_role = session.get('role', 'GUEST')
     with get_db_connection() as conn:
         rows = conn.execute("""
             SELECT c.*,
-                   (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count
+                   (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count,
+                   (SELECT COUNT(*) FROM collection_files cf JOIN files f ON cf.file_id = f.id WHERE cf.collection_id = c.id AND (f.type = 'document' OR LOWER(f.name) LIKE '%.txt' OR LOWER(f.name) LIKE '%.md')) AS note_count
             FROM collections c
             ORDER BY c.name
         """).fetchall()
@@ -6504,16 +6537,26 @@ def get_collections():
 @app.route('/galleryout/api/sidebar_state')
 def get_sidebar_state():
     """Returns the current state of folders and collections for real-time sync."""
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     folders = get_dynamic_folder_config(force_refresh=True)
     with get_db_connection() as conn:
         flags = conn.execute("SELECT * FROM collections WHERE type='system_flag' ORDER BY id").fetchall()
         if IS_EXHIBITION_MODE:
-            albums = conn.execute("SELECT * FROM collections WHERE type='user_album' ORDER BY name").fetchall()
+            albums = conn.execute("""
+                SELECT c.*,
+                       (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count,
+                       (SELECT COUNT(*) FROM collection_files cf JOIN files f ON cf.file_id = f.id WHERE cf.collection_id = c.id AND (f.type = 'document' OR LOWER(f.name) LIKE '%.txt' OR LOWER(f.name) LIKE '%.md')) AS note_count
+                FROM collections c
+                WHERE c.type='user_album'
+                ORDER BY c.name
+            """).fetchall()
             all_count = None
         else:
             albums = conn.execute("""
                 SELECT c.*,
-                       (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count
+                       (SELECT COUNT(*) FROM collection_files cf WHERE cf.collection_id = c.id) AS file_count,
+                       (SELECT COUNT(*) FROM collection_files cf JOIN files f ON cf.file_id = f.id WHERE cf.collection_id = c.id AND (f.type = 'document' OR LOWER(f.name) LIKE '%.txt' OR LOWER(f.name) LIKE '%.md')) AS note_count
                 FROM collections c
                 WHERE c.type='user_album'
                 ORDER BY c.name
@@ -6680,6 +6723,8 @@ def share_collection():
 @app.route('/galleryout/api/file_collections/<string:file_id>')
 def get_file_collections(file_id):
     """Returns a list of all collections and status flags associated with a file."""
+    if not is_file_accessible(file_id):
+        return jsonify({'status': 'error', 'message': 'Access Denied'}), 403
     # Check if frontend specifically requested only public collections (Exhibition mode)
     public_only = request.args.get('public_only', 'false').lower() == 'true'
     
@@ -6844,6 +6889,19 @@ def tag_batch():
 @app.route('/galleryout/collection/<coll_id>')
 def collection_view(coll_id):
     global gallery_view_cache
+
+    # AUTHENTICATION CHECK FOR EXHIBITION / FORCE_LOGIN MODES
+    is_management_side = not IS_EXHIBITION_MODE
+    is_logged_in = 'user_id' in session
+    must_authenticate = IS_EXHIBITION_MODE or FORCE_LOGIN
+
+    if must_authenticate and not is_logged_in:
+        if request.headers.get('Accept') == 'application/json':
+            return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
+        return render_template('exhibition_login.html', 
+                               app_version=APP_VERSION, 
+                               enable_guest_login=ENABLE_GUEST_LOGIN if IS_EXHIBITION_MODE else False,
+                               admin_side=is_management_side)
     
     # 1. Handle Virtual "All Categories" vs Specific Collection
     coll_info = None
@@ -6905,8 +6963,10 @@ def collection_view(coll_id):
     req_sort_order = request.args.get('sort_order', 'desc').upper()
     if req_sort_order not in ['ASC', 'DESC']: req_sort_order = 'DESC'
 
+    active_filters_count = 0
+
     # 3. Build Dynamic Query Conditions
-    conditions = []
+    conditions = ["f.id IN (SELECT id FROM files WHERE type != 'document' AND LOWER(name) NOT LIKE '%.txt' AND LOWER(name) NOT LIKE '%.md')"]
     params = []
 
     if is_all_mode:
@@ -6924,17 +6984,71 @@ def collection_view(coll_id):
         
         conditions.append(f"cf.collection_id IN ({sub_query})")
     else:
-        # Standard logic for a specific collection ID
-        conditions.append("cf.collection_id = ?")
-        params.append(int(coll_id))
+        is_recursive = request.args.get('recursive', 'false').lower() == 'true'
+        if is_recursive:
+            active_filters_count += 1
+            user_role = session.get('role', 'GUEST')
+            safe_uid = str(session.get('user_id', '')).replace("'", "''")
+            is_local_admin = (not FORCE_LOGIN and not IS_EXHIBITION_MODE)
+            
+            sub_query = f"""
+                WITH RECURSIVE children AS (
+                    SELECT id, is_public, shared_users FROM collections WHERE id = {int(coll_id)}
+                    UNION ALL
+                    SELECT c.id, c.is_public, c.shared_users FROM collections c INNER JOIN children p ON c.parent_id = p.id
+                )
+                SELECT id FROM children
+            """
+            if IS_EXHIBITION_MODE:
+                if is_local_admin or user_role in ['ADMIN', 'MANAGER', 'STAFF']:
+                    pass # Staff sees all nested
+                else:
+                    sub_query += f" WHERE (is_public = 1 OR (',' || shared_users || ',') LIKE '%,{safe_uid},%')"
+            
+            conditions.append(f"cf.collection_id IN ({sub_query})")
+        else:
+            conditions.append("cf.collection_id = ?")
+            params.append(int(coll_id))
     
     # --- Apply common filters ---
-    active_filters_count = 0
 
     if search_term:
-        conditions.append("f.name LIKE ?")
-        params.append(f"%{search_term}%")
         active_filters_count += 1
+        for kw in [k.strip() for k in search_term.split(',') if k.strip()]:
+            sub_kws = [s.strip() for s in kw.split(';') if s.strip()]
+            if not sub_kws: continue
+            
+            or_conds = []
+            not_conds = []
+            for s in sub_kws:
+                is_not = False
+                if s.startswith('!'):
+                    is_not = True
+                    s = s[1:].strip()
+                if not s: continue
+                
+                if s.startswith('"') and s.endswith('"') and len(s) > 2:
+                    cond_str = f"f.name {'NOT LIKE' if is_not else 'LIKE'} ?"
+                    param_val = f"%{s[1:-1]}%"
+                else:
+                    cond_str = f"f.name {'NOT LIKE' if is_not else 'LIKE'} ?"
+                    param_val = f"%{s}%"
+                    
+                if is_not:
+                    not_conds.append((cond_str, param_val))
+                else:
+                    or_conds.append((cond_str, param_val))
+                    
+            if or_conds:
+                if len(or_conds) > 1:
+                    conditions.append("(" + " OR ".join([c[0] for c in or_conds]) + ")")
+                elif len(or_conds) == 1:
+                    conditions.append(or_conds[0][0])
+                params.extend([c[1] for c in or_conds])
+                
+            for cond, param in not_conds:
+                conditions.append(cond)
+                params.append(param)
     
     if wf_files:
         active_filters_count += 1
@@ -7070,17 +7184,19 @@ def collection_view(coll_id):
         active_filters_count += 1
 
     if start_date:
-        active_filters_count += 1
         try: 
+            ts = datetime.strptime(start_date, '%Y-%m-%d').timestamp()
             conditions.append("f.mtime >= ?")
-            params.append(datetime.strptime(start_date, '%Y-%m-%d').timestamp())
+            params.append(ts)
+            active_filters_count += 1
         except: pass
     if end_date:
+        try: 
+            ts = datetime.strptime(end_date, '%Y-%m-%d').timestamp() + 86399
+            conditions.append("f.mtime <= ?")
+            params.append(ts)
             active_filters_count += 1
-            try: 
-                conditions.append("f.mtime <= ?")
-                params.append(datetime.strptime(end_date, '%Y-%m-%d').timestamp() + 86399)
-            except: pass
+        except: pass
 
     if selected_rating_ranges:
         active_filters_count += 1
@@ -7251,13 +7367,72 @@ def collection_view(coll_id):
     
     fake_folder_key = f"collection_{coll_id}"
 
+    # Fetch notes dynamically for the current collection
+    has_notes = False
+    note_files = []
+    try:
+        with get_db_connection() as conn_notes:
+            query = '''
+                SELECT DISTINCT f.id, f.name, f.path, f.mtime, f.type 
+                FROM files f 
+                JOIN collection_files cf ON f.id = cf.file_id 
+                WHERE (cf.collection_id = ? OR ? = 'all') 
+                AND (f.type = 'document' OR LOWER(f.name) LIKE '%.txt' OR LOWER(f.name) LIKE '%.md')
+                ORDER BY f.mtime DESC
+            '''
+            rows = conn_notes.execute(query, (coll_id if coll_id != 'all' else -1, coll_id)).fetchall()
+            note_files = [dict(r) for r in rows]
+            has_notes = len(note_files) > 0
+    except Exception:
+        pass
+
+    # Standard metadata extraction for UI filters
+    extensions = set()
+    prefixes = set()
+    prefix_limit_reached = False
+    
+    # Extract all extensions independently from filters to populate the dropdowns fully
+    with get_db_connection() as conn_ext:
+        ext_query = "SELECT DISTINCT f.name FROM files f JOIN collection_files cf ON f.id = cf.file_id"
+        if not is_all_mode:
+            ext_query += f" WHERE cf.collection_id = {int(coll_id)}"
+        else:
+            count_subquery = "SELECT id FROM collections WHERE type='user_album'"
+            if IS_EXHIBITION_MODE: 
+                user_role = session.get('role', 'GUEST')
+                safe_uid = str(session.get('user_id', '')).replace("'", "''")
+                is_local_admin = (not FORCE_LOGIN and not IS_EXHIBITION_MODE)
+                if is_local_admin or user_role in['ADMIN', 'MANAGER', 'STAFF']:
+                    count_subquery += " AND (is_public = 1 OR shared_users != '')"
+                else:
+                    count_subquery += f" AND (is_public = 1 OR (',' || shared_users || ',') LIKE '%,{safe_uid},%')"
+            ext_query += f" WHERE cf.collection_id IN ({count_subquery})"
+            
+        ext_rows = conn_ext.execute(ext_query).fetchall()
+        for r in ext_rows:
+            fname = r['name']
+            if '.' in fname:
+                ext_clean = fname.split('.')[-1].lower()
+                if ext_clean not in ['txt', 'md']:
+                    extensions.add(ext_clean)
+            if not prefix_limit_reached and '_' in fname:
+                pfx = fname.split('_')[0]
+                if pfx:
+                    prefixes.add(pfx)
+                    if len(prefixes) > MAX_PREFIX_DROPDOWN_ITEMS:
+                        prefix_limit_reached = True
+                        prefixes.clear()
+
     # --- JSON RESPONSE FOR AJAX/EXHIBITION ---
     if request.headers.get('Accept') == 'application/json':
         return jsonify({
             'status': 'success',
             'collection_name': coll_info['name'],
             'files': final_files,
-            'total_count': total_folder_files 
+            'total_count': total_folder_files,
+            'has_notes': has_notes,
+            'note_files': note_files,
+            'available_extensions': sorted(list(extensions))
         })
     
     # --- TEMPLATE RENDERING ---
@@ -7289,22 +7464,6 @@ def collection_view(coll_id):
     }
     
     folders = get_dynamic_folder_config()
-    
-    # Standard metadata extraction for UI filters
-    extensions = set()
-    prefixes = set()
-    prefix_limit_reached = False
-    
-    for f in final_files:
-        fname = f['name']
-        if '.' in fname: extensions.add(fname.split('.')[-1].lower())
-        if not prefix_limit_reached and '_' in fname:
-            pfx = fname.split('_')[0]
-            if pfx:
-                prefixes.add(pfx)
-                if len(prefixes) > MAX_PREFIX_DROPDOWN_ITEMS:
-                    prefix_limit_reached = True
-                    prefixes.clear()
 
     try:
         with get_db_connection() as conn_opts:
@@ -7340,7 +7499,8 @@ def collection_view(coll_id):
                            app_version=APP_VERSION, github_url=GITHUB_REPO_URL,
                            update_available=UPDATE_AVAILABLE, remote_version=REMOTE_VERSION,
                            ffmpeg_available=(FFPROBE_EXECUTABLE_PATH is not None),
-                           stream_threshold=STREAM_THRESHOLD_BYTES)
+                           stream_threshold=STREAM_THRESHOLD_BYTES,
+                           has_notes=has_notes, note_files=note_files)
 
 # --- EXHIBITION API: RATINGS & COMMENTS ---
 
@@ -7383,6 +7543,8 @@ def get_rating_details():
 
 @app.route('/galleryout/api/exhibition/rate', methods=['POST'])
 def exhibition_rate_file():
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     data = request.json
     file_id = data.get('file_id')
     
@@ -7485,6 +7647,8 @@ def exhibition_rate_batch():
 
 @app.route('/galleryout/api/exhibition/comments', methods=['GET'])
 def exhibition_get_comments():
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     file_id = request.args.get('file_id')
     current_user_id = session.get('user_id')
     current_role = session.get('role', 'GUEST')
@@ -7570,6 +7734,8 @@ def get_users_simple_list():
 
 @app.route('/galleryout/api/exhibition/post_comment', methods=['POST'])
 def exhibition_post_comment():
+    if (IS_EXHIBITION_MODE or FORCE_LOGIN) and not session.get('user_id'):
+        return jsonify({'status': 'error', 'message': 'Authentication required'}), 401
     data = request.json
     file_id = data.get('file_id')
     text = data.get('text', '').strip()
@@ -7695,6 +7861,8 @@ def exhibition_edit_comment():
         return jsonify({'status': 'success'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 
 # --- OMNIQUERY API ---
 @app.route('/galleryout/api/omniquery/execute', methods=['POST'])
@@ -9415,6 +9583,50 @@ def _register_remix_routes_inline():
         except Exception as e: return jsonify({'status': 'error', 'message': str(e)}), 500
 
 _register_remix_routes_inline()
+
+
+@app.route('/galleryout/api/collections/upload_note', methods=['POST'])
+@management_api_only
+def upload_collection_note():
+    coll_id = request.form.get('collection_id')
+    if not coll_id: return jsonify({'status': 'error', 'message': 'Missing collection ID'}), 400
+    
+    if 'file' not in request.files: return jsonify({'status': 'error', 'message': 'No file uploaded'}), 400
+    file = request.files['file']
+    
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.txt', '.md']: return jsonify({'status': 'error', 'message': 'Only .txt and .md files are allowed as notes.'}), 400
+    
+    notes_dir = os.path.join(BASE_OUTPUT_PATH, '.collection_notes')
+    os.makedirs(notes_dir, exist_ok=True)
+    
+    from werkzeug.utils import secure_filename
+    import hashlib, time
+    safe_name = f"note_c{coll_id}_{int(time.time())}_{secure_filename(file.filename)}"
+    dest_path = os.path.join(notes_dir, safe_name)
+    
+    try:
+        file.save(dest_path)
+        mtime = os.path.getmtime(dest_path)
+        file_id = hashlib.md5(dest_path.encode()).hexdigest()
+        file_size = os.path.getsize(dest_path)
+        
+        with get_db_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO files (id, path, mtime, name, type, size) 
+                VALUES (?, ?, ?, ?, 'document', ?)
+            """, (file_id, dest_path, mtime, file.filename, file_size))
+            
+            conn.execute("""
+                INSERT OR IGNORE INTO collection_files (collection_id, file_id, added_at) 
+                VALUES (?, ?, ?)
+            """, (int(coll_id), file_id, time.time()))
+            
+            conn.commit()
+            
+        return jsonify({'status': 'success', 'message': 'Note added successfully to the collection.'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
 
